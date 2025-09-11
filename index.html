@@ -1,0 +1,383 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>California Demand — Hex Sampling within State Boundary</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html,
+    body,
+    #container {
+      margin: 0;
+      height: 100%;
+      width: 100%;
+    }
+
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 9999;
+      background: rgba(255, 255, 255, .96);
+      border-radius: 10px;
+      padding: 8px 10px;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, .15);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    #ui .row {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
+
+    #ui label {
+      font-size: .9rem;
+      color: #333;
+    }
+
+    #ui input[type=range] {
+      width: 180px;
+    }
+  </style>
+
+  <!-- MapLibre GL -->
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
+  <!-- deck.gl -->
+  <script src="https://unpkg.com/deck.gl@8.9.34/dist.min.js"></script>
+
+  <!-- turf.js -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+</head>
+
+<body>
+  <div id="container"></div>
+  <div id="ui">
+    <div class="row"><strong>California Demand</strong></div>
+    <div class="row" style="margin-top:.25rem">
+      <label>Hex size (pixels): <span id="hex_px_label">26</span></label>
+      <input id="hex_px" type="range" min="12" max="60" value="26" step="2" />
+    </div>
+    <div class="row" style="margin-top:.25rem">
+      <label>Opacity (alpha): <span id="hex_opacity_label">125</span></label>
+      <input id="hex_opacity" type="range" min="0" max="255" value="125" step="5" />
+    </div>
+    <div class="row" style="font-size:.8rem;color:#555;margin-top:.25rem">
+      Hex centers sum demand within <b>5 miles</b>. Only drawn inside California boundary. Hover to see values.
+    </div>
+  </div>
+
+  <!-- Inline fallback demand -->
+  <script id="zipdata" type="application/json">[
+    {"latitude":33.973,"longitude":-118.248,"demand":11},
+    {"latitude":37.779,"longitude":-122.419,"demand":7},
+    {"latitude":38.579,"longitude":-121.491,"demand":4}
+  ]</script>
+
+  <!-- Inline fallback boundary (simple box) -->
+  <script id="cali-boundary" type="application/json">
+  {
+    "type":"FeatureCollection",
+    "features":[
+      {
+        "type":"Feature",
+        "properties":{"name":"California"},
+        "geometry":{
+          "type":"Polygon",
+          "coordinates":[[
+            [-124.4096,32.5342],
+            [-114.1312,32.5342],
+            [-114.1312,42.0095],
+            [-124.4096,42.0095],
+            [-124.4096,32.5342]
+          ]]
+        }
+      }
+    ]
+  }
+  </script>
+
+  <script>
+    // CONFIG
+    const DATA_URL = './zips.json';
+    const USE_INLINE_FALLBACK = true;
+    const MAP_STYLE = `https://api.maptiler.com/maps/streets/style.json?key=NYtv1R1Zg4AkgQWZVE5K`; // replace with your real key
+    const START_VIEW = { latitude: 37.25, longitude: -119.75, zoom: 6, bearing: 0, pitch: 0 };
+    const FIVE_MILES_KM = 5 * 1.609344;
+    const EARTH_RADIUS_KM = 6371.0088;
+    //const US_STATES_GEOJSON = 'https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json';
+    const CA_BOUNDARY_URL = './ca_boundary.json';
+    const SHOW_ZERO_CELLS = false;
+
+    const hexPxSlider = document.getElementById('hex_px');
+    const hexPxLabel = document.getElementById('hex_px_label');
+    let HEX_PIXEL_SIZE = +hexPxSlider.value;
+
+    const hexOpacitySlider = document.getElementById('hex_opacity');
+    const hexOpacityLabel = document.getElementById('hex_opacity_label');
+    let HEX_OPACITY = +hexOpacitySlider.value;
+
+    // UTILS
+    function metersPerPixel(lat, zoom) {
+      const mpp256 = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      return mpp256 / 2;
+    }
+
+    function hexPolygon([lon, lat], Rm) {
+      const latRad = lat * Math.PI / 180;
+      const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latRad) + 1.175 * Math.cos(4 * latRad);
+      const mPerDegLon = 111412.84 * Math.cos(latRad) - 93.5 * Math.cos(3 * latRad);
+      const dLat = Rm / mPerDegLat, dLon = Rm / mPerDegLon;
+      const ang = [30, 90, 150, 210, 270, 330].map(a => a * Math.PI / 180);
+      return ang.map(a => [lon + dLon * Math.cos(a), lat + dLat * Math.sin(a)]);
+    }
+
+    function makeHexCenters(vs, hexPixelSize = HEX_PIXEL_SIZE) {
+      const { longitude, latitude, zoom, width, height } = vs;
+      const mpp = metersPerPixel(latitude, zoom);
+      const Rm = Math.max(200, (hexPixelSize * mpp) / 2);
+
+      const vp = new deck.WebMercatorViewport(vs);
+      const nw = vp.unproject([0, 0]);
+      const se = vp.unproject([width, height]);
+      const minLon = Math.min(nw[0], se[0]);
+      const maxLon = Math.max(nw[0], se[0]);
+      const minLat = Math.min(se[1], nw[1]);
+      const maxLat = Math.max(se[1], nw[1]);
+
+      const latRad = latitude * Math.PI / 180;
+      const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latRad) + 1.175 * Math.cos(4 * latRad);
+      const mPerDegLon = 111412.84 * Math.cos(latRad) - 93.5 * Math.cos(3 * latRad);
+      const stepLon = (2 * Rm) / mPerDegLon;
+      const stepLat = (Math.sqrt(3) * Rm) / mPerDegLat;
+
+      const centers = [];
+      let row = 0;
+      for (let lat = minLat - stepLat; lat <= maxLat + stepLat; lat += stepLat, row++) {
+        const lonOffset = (row % 2 === 0) ? 0 : stepLon / 2;
+        for (let lon = minLon - stepLon; lon <= maxLon + stepLon; lon += stepLon) {
+          centers.push([lon + lonOffset, lat]);
+        }
+      }
+      return { centers, hexRadiusMeters: Rm };
+    }
+
+    function haversineKm(lat1, lon1, lat2, lon2) {
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+      return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(a));
+    }
+
+    // GLOBALS
+    let POINTS = [];
+    let CA_FEATURE = null;
+    let overlay = null;
+    let map = null;
+
+    // LOADERS
+    async function loadData() {
+      try {
+        const r = await fetch(DATA_URL, { cache: 'no-cache' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return await r.json();
+      } catch (e) {
+        if (!USE_INLINE_FALLBACK) throw e;
+        return JSON.parse(document.getElementById('zipdata').textContent.trim());
+      }
+    }
+
+
+    async function loadBoundary() {
+      // Try local high-res file first
+      try {
+        const r = await fetch(CA_BOUNDARY_URL, { cache: 'no-cache' });
+        if (r.ok) {
+          const gj = await r.json();
+
+          // --- Normalize to a single Feature (Polygon/MultiPolygon)
+          let feat;
+          if (gj.type === 'Feature') {
+            feat = gj;
+          } else if (gj.type === 'FeatureCollection') {
+            // If your json has multiple features, pick the one that is CA or a Polygon
+            feat = gj.features.find(f =>
+              f?.geometry?.type === 'Polygon' || f?.geometry?.type === 'MultiPolygon'
+            ) || gj.features[0];
+          } else if (gj.type === 'Polygon' || gj.type === 'MultiPolygon') {
+            feat = { type: 'Feature', properties: { name: 'California' }, geometry: gj };
+          }
+
+          if (!feat || !feat.geometry || !feat.geometry.coordinates) {
+            console.error('CA boundary file did not contain a Polygon/MultiPolygon Feature:', gj);
+            throw new Error('Invalid CA boundary GeoJSON');
+          }
+
+          console.log('CA boundary loaded. type:', feat.geometry.type);
+          return feat;
+        }
+      } catch (e) {
+        console.warn('CA polygon fetch failed, falling back to inline rectangle.', e);
+      }
+
+      // Fallback: inline rectangle you already had
+      const fc = JSON.parse(document.getElementById('cali-boundary').textContent.trim());
+      return fc.features[0];
+    }
+
+    // RENDER
+    function renderDemand(viewState) {
+      if (!CA_FEATURE) return;
+      const { centers, hexRadiusMeters } = makeHexCenters(viewState);
+      const features = [];
+
+      centers.forEach(([lon, lat]) => {
+        if (!turf.booleanPointInPolygon([lon, lat], CA_FEATURE)) return;
+        const latBand = FIVE_MILES_KM / 111.32;
+        const lonBand = FIVE_MILES_KM / (111.32 * Math.cos(lat * Math.PI / 180));
+        let sum = 0;
+        for (const p of POINTS) {
+          if (p.lat < lat - latBand || p.lat > lat + latBand) continue;
+          if (p.lon < lon - lonBand || p.lon > lon + lonBand) continue;
+          if (haversineKm(lat, lon, p.lat, p.lon) <= FIVE_MILES_KM) sum += p.demand;
+        }
+        features.push({ center: [lon, lat], sum });
+      });
+
+      const used = SHOW_ZERO_CELLS ? features : features.filter(f => f.sum > 0);
+      if (used.length === 0) {
+        overlay.setProps({
+          layers: [new deck.GeoJsonLayer({
+            id: 'cali-border',
+            data: CA_FEATURE,
+            stroked: true,
+            filled: false,
+            getLineColor: [0, 0, 0, 200],
+            lineWidthMinPixels: 2
+          })],
+          getTooltip: null
+        });
+        return;
+      }
+
+      const maxSum = Math.max(1, ...used.map(f => f.sum));
+      const colorFor = v => {
+        const t = Math.min(1, v / maxSum);
+        return [255, Math.floor(255 * (1 - t)), Math.floor(60 + 60 * (1 - t)), HEX_OPACITY];
+      };
+
+      const polygons = used.map(f => ({
+        polygon: hexPolygon(f.center, hexRadiusMeters),
+        sum: f.sum,
+        color: colorFor(f.sum)
+      }));
+
+      const hexLayer = new deck.PolygonLayer({
+        id: 'demand-hexes',
+        data: polygons,
+        getPolygon: d => d.polygon,
+        getFillColor: d => d.color,
+        stroked: false,
+        filled: true,
+        pickable: true
+      });
+
+      const borderLayer = new deck.GeoJsonLayer({
+        id: 'cali-border',
+        data: CA_FEATURE,
+        stroked: true,
+        filled: false,
+        getLineColor: [0, 0, 0, 200],
+        lineWidthMinPixels: 2
+      });
+
+      overlay.setProps({
+        layers: [borderLayer, hexLayer],
+        getTooltip: ({ object }) => object ? `Sum demand (5mi): ${object.sum}` : null
+      });
+    }
+
+    // STARTUP
+    Promise.all([loadData(), loadBoundary()]).then(([rows, ca]) => {
+      POINTS = rows.map(d => ({ lon: +d.longitude, lat: +d.latitude, demand: Number(d.demand) || 0 }))
+        .filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat));
+      console.log('Loaded ZIP points:', POINTS.length);
+      CA_FEATURE = ca;
+      console.log('Loaded CA feature from source:', CA_FEATURE.properties?.name || CA_FEATURE.properties?.NAME);
+
+      map = new maplibregl.Map({
+        container: 'container',
+        style: MAP_STYLE,
+        center: [START_VIEW.longitude, START_VIEW.latitude],
+        zoom: START_VIEW.zoom
+      });
+
+      overlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
+      map.addControl(overlay);
+
+      map.on('move', () => {
+        const vs = {
+          longitude: map.getCenter().lng,
+          latitude: map.getCenter().lat,
+          zoom: map.getZoom(),
+          pitch: map.getPitch(),
+          bearing: map.getBearing(),
+          width: map.getContainer().clientWidth,
+          height: map.getContainer().clientHeight
+        };
+        renderDemand(vs);
+      });
+
+      // First render
+      renderDemand({
+        longitude: map.getCenter().lng,
+        latitude: map.getCenter().lat,
+        zoom: map.getZoom(),
+        pitch: map.getPitch(),
+        bearing: map.getBearing(),
+        width: map.getContainer().clientWidth,
+        height: map.getContainer().clientHeight
+      });
+    });
+
+    // SLIDERS
+    hexPxSlider.addEventListener('input', () => {
+      HEX_PIXEL_SIZE = +hexPxSlider.value;
+      hexPxLabel.textContent = HEX_PIXEL_SIZE;
+      if (map) {
+        const vs = {
+          longitude: map.getCenter().lng,
+          latitude: map.getCenter().lat,
+          zoom: map.getZoom(),
+          pitch: map.getPitch(),
+          bearing: map.getBearing(),
+          width: map.getContainer().clientWidth,
+          height: map.getContainer().clientHeight
+        };
+        renderDemand(vs);
+      }
+    });
+
+    hexOpacitySlider.addEventListener('input', () => {
+      HEX_OPACITY = +hexOpacitySlider.value;
+      hexOpacityLabel.textContent = HEX_OPACITY;
+      if (map) {
+        const vs = {
+          longitude: map.getCenter().lng,
+          latitude: map.getCenter().lat,
+          zoom: map.getZoom(),
+          pitch: map.getPitch(),
+          bearing: map.getBearing(),
+          width: map.getContainer().clientWidth,
+          height: map.getContainer().clientHeight
+        };
+        renderDemand(vs);
+      }
+    });
+  </script>
+</body>
+
+</html>
