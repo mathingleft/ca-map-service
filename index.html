@@ -51,12 +51,14 @@
 
   <!-- turf.js -->
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <script src="./rbush.min.js"></script>
+
 </head>
 
 <body>
   <div id="container"></div>
   <div id="ui">
-    <div class="row"><strong>California Demand</strong></div>
+    <div class="row"><strong>California Map Service</strong></div>
     <div class="row" style="margin-top:.25rem">
       <label>Hex size (pixels): <span id="hex_px_label">26</span></label>
       <input id="hex_px" type="range" min="12" max="60" value="26" step="2" />
@@ -66,11 +68,11 @@
       <input id="hex_opacity" type="range" min="0" max="255" value="125" step="5" />
     </div>
     <div class="row" style="margin-top:.25rem">
-      <input id="allow_zero" type="checkbox" checked/>
-      <label for="allow_zero">
-        Allow (radius < starting radius)
-        when (ZIP's doctors ≥ 5), approximated by increasing demand in radius of 0.1 miles
-      </label>
+      <input id="allow_zero" type="checkbox" checked />
+      <label for="allow_zero">Allow (radius < starting radius) when (ZIP's doctors ≥ 5)</label>
+    </div>
+    <div class="row" style="font-size:0.9rem;color:#555;margin-bottom:.3rem">
+      Approximated by affecting demand in radius of 0.1 miles.
     </div>
     <div class="row" style="margin-top:.25rem">
       <label for="start_radius">Starting radius (mi):</label>
@@ -85,8 +87,8 @@
   <script>
     // CONFIG
     const DATA_URL = './zips.json';
-    const USE_INLINE_FALLBACK = true;
     const MAP_STYLE = `https://api.maptiler.com/maps/streets/style.json?key=NYtv1R1Zg4AkgQWZVE5K`;
+    const ZCTA_URL = './zcta_ca_centroid.geojson';
     const START_VIEW = { latitude: 37.25, longitude: -119.75, zoom: 6, bearing: 0, pitch: 0 };
     const MI_TO_KM = 1.609344;
     const MAX_HEX_DISTANCE_MI = 150;
@@ -179,6 +181,8 @@
     let POINTS = [];
     let SUM_DOCTORS = null;
     let CA_FEATURE = null;
+    let ZCTA_FEATURES = null;
+    let ZCTA_INDEX = null;
     let overlay = null;
     let map = null;
 
@@ -194,6 +198,68 @@
       }
     }
 
+    function buildZctaIndex() {
+      ZCTA_INDEX = rbush(9);
+      const items = [];
+      const feats = (ZCTA_FEATURES && ZCTA_FEATURES.features) || [];
+      for (let i = 0; i < feats.length; i++) {
+        const b = turf.bbox(feats[i]); // [minX, minY, maxX, maxY] in [lon, lat]
+        items.push({ minX: b[0], minY: b[1], maxX: b[2], maxY: b[3], i });
+      }
+      ZCTA_INDEX.load(items);
+    }
+
+    /** Returns containing ZCTA feature for (lon,lat), or null */
+    function findZctaForPoint(lon, lat) {
+      if (!ZCTA_INDEX) return null;
+      const cands = ZCTA_INDEX.search({ minX: lon, minY: lat, maxX: lon, maxY: lat });
+      for (const it of cands) {
+        const f = ZCTA_FEATURES.features[it.i];
+        if (turf.booleanPointInPolygon([lon, lat], f)) return f;
+      }
+      return null;
+    }
+
+    async function ensureRbush() {
+      // If already present (e.g., from local rbush.min.js), done.
+      if (window.rbush) return;
+
+      // Try dynamic ESM imports that return the class as .default
+      const candidates = [
+        'https://cdn.jsdelivr.net/npm/rbush@3.0.1/+esm',
+        'https://unpkg.com/rbush@3.0.1/+esm'
+      ];
+
+      for (const url of candidates) {
+        try {
+          const mod = await import(url);
+          // expose a global-compatible factory so the rest of your code can call rbush(...)
+          window.rbush = function rbushFactory(maxEntries) {
+            // rbush ESM default export is the class; `new` creates the tree
+            return new mod.default(maxEntries);
+          };
+          return;
+        } catch (e) {
+          console.warn('Failed to import rbush from', url, e);
+        }
+      }
+
+      // Last resort: try loading a local fallback if you saved rbush.min.js next to index.html
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = './rbush.min.js';
+          s.onload = resolve;
+          s.onerror = reject;
+          document.head.appendChild(s);
+        });
+        if (window.rbush) return;
+      } catch (e) {
+        console.warn('Local rbush.min.js failed to load', e);
+      }
+
+      throw new Error('rbush could not be loaded from any source');
+    }
 
     async function loadBoundary() {
       // Try local high-res file first
@@ -294,30 +360,30 @@
             if (!withinMilesBB(hxLat, hxLon, lat, lon, rMiles) ||
               haversineKm(hxLat, hxLon, lat, lon) > rMiles * MI_TO_KM) continue;
           } else {
-            // "radius = 0" → allow small local tolerance
-            const EPS_MILES = 0.5; // ≈ 528 ft
-            if (haversineKm(hxLat, hxLon, lat, lon) > EPS_MILES * MI_TO_KM) continue;
+            // radius == 0 → require hex center and the data point to be in the SAME ZCTA polygon
+            const zcta = findZctaForPoint(hxLon, hxLat); // [lon, lat]
+            if (!zcta) continue;
+
+            // Is the source point inside this very polygon?
+            if (!turf.booleanPointInPolygon([lon, lat], zcta)) continue;
+            /*
+            // (Optional) require ≥5 doctors in that ZCTA
+            const hexZip = String(
+              zcta.properties.zip ||
+              zcta.properties.GEOID10 ||
+              zcta.properties.ZCTA5CE10 ||
+              ''
+            ).padStart(5, '0');
+
+            const doctorsTotal = Number(
+              (zcta.properties && zcta.properties.doctors_total) ??
+              (DOCS_BY_ZIP && DOCS_BY_ZIP[hexZip]) ?? 0
+            );
+            if (allowZero && doctorsTotal < 5) continue;
+            */
           }
-          
-          /*
-          // Sum doctors around THIS ZIP within rMiles
-          let sumDocs = 0;
-          if (rMiles === 0) {
-            for (let j = 0; j < ZN; j++) {
-              if (zLat[j] === lat && zLon[j] === lon) sumDocs += zDoc[j];
-            }
-          } else {
-            const { latBand, lonBand } = bandsForMiles(lat, rMiles);
-            const rKm = rMiles * MI_TO_KM;
-            for (let j = 0; j < ZN; j++) {
-              const lj = zLat[j], mj = zLon[j];
-              if (!(lj >= lat - latBand && lj <= lat + latBand &&
-                mj >= lon - lonBand && mj <= lon + lonBand)) continue;
-              if (haversineKm(lat, lon, lj, mj) <= rKm) sumDocs += zDoc[j];
-            }
-          }
-          */
-          const rIdx = Math.max(0, Math.min(150, rMiles|0));   // clamp & ensure integer
+
+          const rIdx = Math.max(0, Math.min(150, rMiles | 0));   // clamp & ensure integer
           const sumDocs = SUM_DOCTORS[i][rIdx] || 0;
 
           if (sumDocs > 0) adjusted += (zDem[i] / sumDocs);
@@ -377,31 +443,50 @@
         lineWidthMinPixels: 2
       });
 
+      const zctaOutlineLayer = new deck.GeoJsonLayer({
+        id: 'zcta-outline',
+        data: ZCTA_FEATURES || { type: 'FeatureCollection', features: [] },
+        stroked: true,
+        filled: false,
+        getLineColor: [85, 85, 85, 180],
+        lineWidthMinPixels: 1
+      });
+
+
       overlay.setProps({
-        layers: [borderLayer, hexLayer],
+        layers: [borderLayer, zctaOutlineLayer, hexLayer],
         getTooltip: ({ object }) =>
           object ? `Panel demand per yearly quarter per doctor: ${object.adjusted.toFixed(4)}` : null
       });
     }
 
     // STARTUP
-    Promise.all([loadData(), loadBoundary()]).then(([rows, ca]) => {
+    Promise.all([
+      ensureRbush(),
+      loadData(),
+      loadBoundary(),
+      fetch(ZCTA_URL).then(r => r.json()),
+      //fetch(DOCS_BY_ZIP_URL).then(r => r.ok ? r.json() : ({})) // ok if missing
+    ]).then(([_, rows, ca, zcta]) => {
       POINTS = rows.map(d => ({
         lon: +d.longitude,
         lat: +d.latitude,
         demand: Number(d.demand) || 0,
         min_radius: Math.max(0, Math.round(Number(d.min_radius) || 0)),
-        //doctors: Number(d.doctors) || 0,
-        //sum_doctors: d.sum_doctors
+        zip: ('' + (d.zip ?? d.ZIP ?? '')).padStart(5, '0') // <-- keep ZIP for r=0 check
       })).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat));
       console.log('Loaded ZIP points:', POINTS.length);
-      CA_FEATURE = ca;
-      console.log(
-        'Loaded CA feature from source:',
-        CA_FEATURE.properties?.name || CA_FEATURE.properties?.NAME
-      );
 
+      CA_FEATURE = ca;
+      console.log('Loaded CA feature from source:', CA_FEATURE.properties?.name || CA_FEATURE.properties?.NAME);
+
+      // If your DATA_URL is doctors_cumu.json, this exists; if it's zips.json, ensure it has sum_doctors
       SUM_DOCTORS = rows.map(d => d.sum_doctors);
+
+      ZCTA_FEATURES = zcta;
+      //DOCS_BY_ZIP = docsByZip || {};
+
+      buildZctaIndex(); // <-- build spatial index once
 
       map = new maplibregl.Map({
         container: 'container',
@@ -437,6 +522,7 @@
         height: map.getContainer().clientHeight
       });
     });
+
 
     // SLIDERS
     hexPxSlider.addEventListener('input', () => {
