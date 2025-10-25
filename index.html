@@ -60,12 +60,15 @@
   <div id="ui">
     <div class="row"><strong>California Map Service</strong></div>
     <div class="row" style="margin-top:.25rem">
-      <label>Hex size (pixels): <span id="hex_px_label">26</span></label>
-      <input id="hex_px" type="range" min="12" max="60" value="26" step="2" />
+      <label for="category">Category:</label>
+      <select id="category"></select>
     </div>
     <div class="row" style="margin-top:.25rem">
-      <label>Opacity (alpha): <span id="hex_opacity_label">125</span></label>
-      <input id="hex_opacity" type="range" min="0" max="255" value="125" step="5" />
+      <label for="coverage_mode">Coverage:</label>
+      <select id="coverage_mode">
+        <option value="integer">Integer radii</option>
+        <option value="exact">Exact min distance</option>
+      </select>
     </div>
     <div class="row" style="margin-top:.25rem">
       <input id="allow_zero" type="checkbox" checked />
@@ -82,6 +85,14 @@
       <label for="inc_radius">Radius increment (mi):</label>
       <input id="inc_radius" type="number" min="1" step="1" value="5" />
     </div>
+    <div class="row" style="margin-top:.25rem">
+      <label>Hex size (pixels): <span id="hex_px_label">24</span></label>
+      <input id="hex_px" type="range" min="12" max="60" value="26" step="2" />
+    </div>
+    <div class="row" style="margin-top:.25rem">
+      <label>Opacity (alpha): <span id="hex_opacity_label">125</span></label>
+      <input id="hex_opacity" type="range" min="0" max="255" value="125" step="5" />
+    </div>
   </div>
 
   <script>
@@ -90,14 +101,19 @@
     const MAP_STYLE = `https://api.maptiler.com/maps/streets/style.json?key=NYtv1R1Zg4AkgQWZVE5K`;
     const ZCTA_URL = './zcta_ca_centroid.geojson';
     const START_VIEW = { latitude: 37.25, longitude: -119.75, zoom: 6, bearing: 0, pitch: 0 };
-    const MI_TO_KM = 1.609344;
-    const MAX_HEX_DISTANCE_MI = 150;
-    const MAX_HEX_DISTANCE_KM = MAX_HEX_DISTANCE_MI * MI_TO_KM;
+    const MAX_HEX_DISTANCE = 150; // miles
 
-    const EARTH_RADIUS_KM = 6371.0088;
+    const EARTH_RADIUS = 3958.7564; // miles
     //const US_STATES_GEOJSON = 'https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json';
     const CA_BOUNDARY_URL = './ca_boundary.json';
     const SHOW_ZERO_CELLS = false;
+
+    const categoryEl = document.getElementById('category');
+    const coverageModeEl = document.getElementById('coverage_mode');
+
+    const allowZeroEl = document.getElementById('allow_zero');
+    const startRadiusEl = document.getElementById('start_radius');
+    const incRadiusEl = document.getElementById('inc_radius');
 
     const hexPxSlider = document.getElementById('hex_px');
     const hexPxLabel = document.getElementById('hex_px_label');
@@ -106,10 +122,6 @@
     const hexOpacitySlider = document.getElementById('hex_opacity');
     const hexOpacityLabel = document.getElementById('hex_opacity_label');
     let HEX_OPACITY = +hexOpacitySlider.value;
-
-    const allowZeroEl = document.getElementById('allow_zero');
-    const startRadiusEl = document.getElementById('start_radius');
-    const incRadiusEl = document.getElementById('inc_radius');
 
     // UTILS
     function metersPerPixel(lat, zoom) {
@@ -156,11 +168,11 @@
       return { centers, hexRadiusMeters: Rm };
     }
 
-    function haversineKm(lat1, lon1, lat2, lon2) {
+    function haversineMi(lat1, lon1, lat2, lon2) {
       const dLat = (lat2 - lat1) * Math.PI / 180;
       const dLon = (lon2 - lon1) * Math.PI / 180;
       const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
-      return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(a));
+      return 2 * EARTH_RADIUS * Math.asin(Math.sqrt(a));
     }
 
     function bandsForMiles(latDeg, miles) {
@@ -176,6 +188,101 @@
       return (lat2 >= lat1 - latBand && lat2 <= lat1 + latBand &&
         lon2 >= lon1 - lonBand && lon2 <= lon1 + lonBand);
     }
+
+    // ---- CATEGORY + NEIGHBOR HELPERS ----
+    const CATS = [];                         // populated at load time, e.g., ["DCH","MOS","MPA",...]
+    let ZIP_IDX = new Map();                 // zip -> row index
+    let ROWS = [];                           // keep raw rows for neighbor lookup
+    let NEIGHBOR_DISTS = [];                 // [i] -> Float64Array distances aligned to nearest_zips
+    let CAT_PREFIX = {};                     // CAT_PREFIX[cat][i] -> Float64Array cumulative doctors aligned to nearest_zips
+    let ABS_MIN_CACHE = {};                  // ABS_MIN_CACHE[cat][i] -> number (abs min radius in mi)
+
+    // upper bound index of x in sorted numeric array arr (first index with arr[k] > x)
+    function upperBound(arr, x) {
+      let lo = 0, hi = arr.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (arr[mid] <= x) lo = mid + 1; else hi = mid;
+      }
+      return lo;
+    }
+
+    function getCategoriesFromRows(sampleRow) {
+      // detect keys ending with "_demand" like "DCH_demand"
+      const cats = [];
+      for (const k of Object.keys(sampleRow)) {
+        const m = /^([A-Z]{3})_demand$/i.exec(k);
+        if (m) cats.push(m[1].toUpperCase());
+      }
+      return cats.length ? cats : ["DCH"]; // fallback
+    }
+
+    function doctorOf(row, cat) {
+      return Number(row[`${cat}_doctors`]) || 0;
+    }
+
+    function demandOf(row, cat) {
+      return Number(row[`${cat}_demand`]) || 0;
+    }
+
+    function ensurePrefix(cat) {
+      if (!CAT_PREFIX[cat]) CAT_PREFIX[cat] = [];
+    }
+
+    function buildNeighborDistsIfNeeded(i) {
+      if (NEIGHBOR_DISTS[i]) return;
+      const zi = ROWS[i];
+      const baseLat = +zi.latitude, baseLon = +zi.longitude;
+      const nbrZips = zi.nearest_zips || [];
+      const dists = new Float64Array(nbrZips.length);
+      for (let k = 0; k < nbrZips.length; k++) {
+        const j = ZIP_IDX.get(nbrZips[k]);
+        const zj = ROWS[j];
+        dists[k] = haversineMi(baseLat, baseLon, +zj.latitude, +zj.longitude);
+      }
+      NEIGHBOR_DISTS[i] = dists;
+    }
+
+    function buildPrefixForCatIfNeeded(cat, i) {
+      ensurePrefix(cat);
+      if (CAT_PREFIX[cat][i]) return;
+      const row = ROWS[i];
+      const nbrZips = row.nearest_zips || [];
+      const pref = new Float64Array(nbrZips.length);
+      let acc = 0;
+      for (let k = 0; k < nbrZips.length; k++) {
+        const j = ZIP_IDX.get(nbrZips[k]);
+        acc += doctorOf(ROWS[j], cat);
+        pref[k] = acc;
+      }
+      CAT_PREFIX[cat][i] = pref;
+    }
+
+    function getAbsMinRadius(cat, i, minDocs = 5) {
+      if (!ABS_MIN_CACHE[cat]) ABS_MIN_CACHE[cat] = [];
+      if (typeof ABS_MIN_CACHE[cat][i] === 'number') return ABS_MIN_CACHE[cat][i];
+      buildNeighborDistsIfNeeded(i);
+      buildPrefixForCatIfNeeded(cat, i);
+
+      const dists = NEIGHBOR_DISTS[i];
+      const pref  = CAT_PREFIX[cat][i];
+      // first index where prefix >= minDocs
+      let k = -1;
+      for (let t = 0; t < pref.length; t++) { if (pref[t] >= minDocs) { k = t; break; } }
+      const val = (k >= 0) ? dists[k] : Infinity;
+      ABS_MIN_CACHE[cat][i] = val;
+      return val;
+    }
+
+    function sumDoctorsWithin(cat, i, radiusMiles) {
+      buildNeighborDistsIfNeeded(i);
+      buildPrefixForCatIfNeeded(cat, i);
+      const dists = NEIGHBOR_DISTS[i];
+      const pref  = CAT_PREFIX[cat][i];
+      const k = upperBound(dists, radiusMiles) - 1; // last index with dist <= radius
+      return (k >= 0) ? pref[k] : 0;
+    }
+
 
     // GLOBALS
     let POINTS = [];
@@ -193,8 +300,7 @@
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return await r.json();
       } catch (e) {
-        if (!USE_INLINE_FALLBACK) throw e;
-        return JSON.parse(document.getElementById('zipdata').textContent.trim());
+        throw e;
       }
     }
 
@@ -302,36 +408,42 @@
     function renderAdjustedDemand(viewState) {
       if (!CA_FEATURE) return;
 
-      // Read UI
-      const allowZero = !!allowZeroEl?.checked;
-      const startMiles = Math.max(0, parseInt(startRadiusEl?.value || '1', 10));
-      const incMiles = Math.max(1, parseInt(incRadiusEl?.value || '1', 10));
-
       // Build hex centers
       const { centers, hexRadiusMeters } = makeHexCenters(viewState);
       const features = [];
 
-      // Pre-extract zip arrays for faster tight loops
+      // UI selections
+      const allowZero    = !!allowZeroEl?.checked;
+      const startMiles   = Math.max(0, parseInt(startRadiusEl?.value || '1', 10));
+      const incMiles     = Math.max(1, parseInt(incRadiusEl?.value || '1', 10));
+      const coverageMode = coverageModeEl?.value || 'integer';
+      const selCat       = (categoryEl?.value || CATS[0] || 'DCH').toUpperCase();
+
+      // Pre-extract for tight loops
       const ZN = POINTS.length;
       const zLat = new Float64Array(ZN);
       const zLon = new Float64Array(ZN);
-      const zDem = new Float64Array(ZN);
-      const zMin = new Int32Array(ZN);
-      //const zDoc = new Float64Array(ZN);
+      const zDem = new Float64Array(ZN); // demand for selected category
+
       for (let i = 0; i < ZN; i++) {
         const p = POINTS[i];
         zLat[i] = +p.lat;
         zLon[i] = +p.lon;
-        zDem[i] = +p.demand || 0;
-        zMin[i] = Math.max(0, Math.round(+p.min_radius || 0));
-        //zDoc[i] = +p.doctors || 0;
+        const row = ROWS[i];
+        zDem[i] = demandOf(row, selCat);       // e.g., DCH_demand
       }
+
+      // in case there are errors with perfect fits for circles
+      const EPS = 0.1;
+      const debugTables = [];
 
       centers.forEach(([hxLon, hxLat]) => {
         if (!turf.booleanPointInPolygon([hxLon, hxLat], CA_FEATURE)) return;
+        
+        const debugRows = [];
 
         // Bounding box for 150 mi around this hex center (cheap prefilter)
-        const { latBand: hexLatBand, lonBand: hexLonBand } = bandsForMiles(hxLat, MAX_HEX_DISTANCE_MI);
+        const { latBand: hexLatBand, lonBand: hexLonBand } = bandsForMiles(hxLat, MAX_HEX_DISTANCE);
 
         let adjusted = 0;
 
@@ -344,50 +456,79 @@
             lon >= hxLon - hexLonBand && lon <= hxLon + hexLonBand)) continue;
 
           // Exact 150-mi check
-          if (haversineKm(hxLat, hxLon, lat, lon) > MAX_HEX_DISTANCE_KM) continue;
+          if (haversineMi(hxLat, hxLon, lat, lon) > MAX_HEX_DISTANCE) continue;
 
-          // Decide working radius for this ZIP
+          // Decide working radius for this ZIP based on the selected category
+          const catAbsMin = Number(ROWS[i]?.[`${selCat}_abs_min_radius`]);
           let rMiles;
-          if (allowZero && zMin[i] === 0) {
-            rMiles = 0;
+          if (coverageMode === 'exact') {
+            // exact fractional miles (allowZero -> 0 stays 0)
+            rMiles = (allowZero && catAbsMin === 0) ? 0 : catAbsMin;
           } else {
-            rMiles = startMiles;
-            while (rMiles < zMin[i]) rMiles += incMiles;
+            // integer stepping: start at UI startMiles and step until >= per-cat abs min
+            if (allowZero && catAbsMin === 0) {
+              rMiles = 0;
+            } else {
+              rMiles = startMiles;
+              while (Number.isFinite(catAbsMin) && rMiles < catAbsMin) rMiles += incMiles;
+            }
           }
+          
+          // DEBUG TESTING PURPOSES, REMOVE AFTER
+          // if (coverageMode !== 'exact' && rMiles > 50) {
+          //   console.log(
+          //     `⚠️ ZIP ${ROWS[i].zip} has suspiciously large radius (${rMiles.toFixed(2)} mi),`,
+          //     `abs_min=${catAbsMin?.toFixed?.(2) || catAbsMin}, startMiles=${startMiles}, inc=${incMiles}`
+          //   );
+          // }
 
-          // If hex–zip distance exceeds working radius, skip this ZIP
+          // Distance gating (unchanged)
           if (rMiles > 0) {
             if (!withinMilesBB(hxLat, hxLon, lat, lon, rMiles) ||
-              haversineKm(hxLat, hxLon, lat, lon) > rMiles * MI_TO_KM) continue;
+                haversineMi(hxLat, hxLon, lat, lon) > rMiles + EPS) continue;
           } else {
-            // radius == 0 → require hex center and the data point to be in the SAME ZCTA polygon
-            const zcta = findZctaForPoint(hxLon, hxLat); // [lon, lat]
+            // r == 0 → same ZCTA requirement (unchanged)
+            const zcta = findZctaForPoint(hxLon, hxLat);
             if (!zcta) continue;
-
-            // Is the source point inside this very polygon?
             if (!turf.booleanPointInPolygon([lon, lat], zcta)) continue;
-            /*
-            // (Optional) require ≥5 doctors in that ZCTA
-            const hexZip = String(
-              zcta.properties.zip ||
-              zcta.properties.GEOID10 ||
-              zcta.properties.ZCTA5CE10 ||
-              ''
-            ).padStart(5, '0');
-
-            const doctorsTotal = Number(
-              (zcta.properties && zcta.properties.doctors_total) ??
-              (DOCS_BY_ZIP && DOCS_BY_ZIP[hexZip]) ?? 0
-            );
-            if (allowZero && doctorsTotal < 5) continue;
-            */
           }
 
-          const rIdx = Math.max(0, Math.min(150, rMiles | 0));   // clamp & ensure integer
-          const sumDocs = SUM_DOCTORS[i][rIdx] || 0;
+          // Denominator: doctors within rMiles for THIS category and THIS source zip i
+          const sumDocs = (rMiles === 0)
+            ? doctorOf(ROWS[i], selCat)         // only self at 0 radius
+            : sumDoctorsWithin(selCat, i, rMiles); // cumulative via nearest_zips / prefix
+          
+
+          // DEBUG!!!
+          if (debugRows) {
+            const distMi = haversineMi(hxLat, hxLon, lat, lon);
+
+            // per-category denominator you already compute
+            // const sumDocs = (rMiles === 0)
+            //   ? doctorOf(ROWS[i], selCat)
+            //   : sumDoctorsWithin(selCat, i, rMiles);
+
+            debugRows.push({
+              zip: ROWS[i].zip,
+              cat: selCat,
+              rMiles: Number(rMiles.toFixed(2)),
+              abs_min: Number((ROWS[i][`${selCat}_abs_min_radius`] ?? 0).toFixed?.(2) || 0),
+              distMi: Number(distMi.toFixed(2)),
+              demand: Number(demandOf(ROWS[i], selCat).toFixed(2)),
+              docsWithinR: Number((sumDocs ?? 0).toFixed(2))
+            });
+          }
 
           if (sumDocs > 0) adjusted += (zDem[i] / sumDocs);
-          // else: no contribution (avoid div-by-zero)
+          
+          if (debugRows) {
+            // Sort contributors by distance for readability
+            //debugRows.sort((a, b) => a.distMi - b.distMi);
+            debugTables.push({
+              hex: `${hxLat.toFixed(5)}, ${hxLon.toFixed(5)}`,
+              rows: debugRows
+            });
+          }
         }
 
         features.push({ center: [hxLon, hxLat], adjusted });
@@ -452,6 +593,12 @@
         lineWidthMinPixels: 1
       });
 
+      if (debugTables.length) {
+        for (const t of debugTables) {
+          console.log(`Contributors for HEX(${t.hex}) — ${t.rows.length} zips`);
+          console.table(t.rows);
+        }
+      }
 
       overlay.setProps({
         layers: [borderLayer, zctaOutlineLayer, hexLayer],
@@ -468,24 +615,32 @@
       fetch(ZCTA_URL).then(r => r.json()),
       //fetch(DOCS_BY_ZIP_URL).then(r => r.ok ? r.json() : ({})) // ok if missing
     ]).then(([_, rows, ca, zcta]) => {
-      POINTS = rows.map(d => ({
-        lon: +d.longitude,
-        lat: +d.latitude,
-        demand: Number(d.demand) || 0,
-        min_radius: Math.max(0, Math.round(Number(d.min_radius) || 0)),
-        zip: ('' + (d.zip ?? d.ZIP ?? '')).padStart(5, '0') // <-- keep ZIP for r=0 check
-      })).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat));
+      ROWS = rows; // keep raw rows
+
+      // Detect categories like DCH/MOS/... from *_demand keys
+      CATS.splice(0, CATS.length, ...getCategoriesFromRows(rows[0] || {}));
+
+      // Populate the category dropdown
+      categoryEl.innerHTML = '';
+      for (const c of CATS) {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        categoryEl.appendChild(opt);
+      }
+
+      // Build POINTS + ZIP index (for fast lookups)
+      POINTS = rows.map((d, idx) => {
+        const zip = ('' + (d.zip ?? d.ZIP ?? '')).padStart(5,'0');
+        ZIP_IDX.set(zip, idx);
+        return { lon: +d.longitude, lat: +d.latitude, zip };
+      }).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat));
       console.log('Loaded ZIP points:', POINTS.length);
 
       CA_FEATURE = ca;
       console.log('Loaded CA feature from source:', CA_FEATURE.properties?.name || CA_FEATURE.properties?.NAME);
 
-      // If your DATA_URL is doctors_cumu.json, this exists; if it's zips.json, ensure it has sum_doctors
-      SUM_DOCTORS = rows.map(d => d.sum_doctors);
-
       ZCTA_FEATURES = zcta;
-      //DOCS_BY_ZIP = docsByZip || {};
-
       buildZctaIndex(); // <-- build spatial index once
 
       map = new maplibregl.Map({
@@ -573,6 +728,8 @@
       renderAdjustedDemand(vs);
     }
 
+    categoryEl.addEventListener('change', rerenderNow);
+    coverageModeEl.addEventListener('change', rerenderNow);
     allowZeroEl.addEventListener('change', rerenderNow);
     startRadiusEl.addEventListener('input', rerenderNow);
     incRadiusEl.addEventListener('input', rerenderNow);
